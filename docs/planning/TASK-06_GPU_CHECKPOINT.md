@@ -431,13 +431,90 @@ Alternativ kann das Checkpoint-Script verwendet werden:
 ./phases/phase1/task03-k8s-gpu-checkpoint/scripts/gpu-checkpoint.sh gpu-test
 ```
 
+## GPU-Restore Analyse
+
+### Checkpoint-Struktur
+
+Der GPU-Checkpoint ist ein POSIX tar-Archiv im containerd Content-Store:
+
+```
+/var/snap/microk8s/common/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/<sha>
+```
+
+**Inhalt des Checkpoints (54 Dateien):**
+
+| Datei | Größe | Beschreibung |
+|-------|-------|--------------|
+| `pages-7.img` | 2.3 GiB | GPU-Speicher (CUDA) |
+| `pages-1..6.img` | je 2 MB | CPU-Speicher Pages |
+| `core-*.img` | < 3 KB | Thread-States |
+| `mm-1.img` | 21 KB | Memory-Map Descriptors |
+| `pagemap-*.img` | < 30 KB | Page-Mapping Metadaten |
+| `tmpfs-*.tar.gz.img` | variabel | tmpfs Mounts |
+| weitere | < 20 KB | Namespaces, Pipes, etc. |
+
+### Restore-Optionen
+
+#### Option A: containerd API (nicht implementiert)
+
+```bash
+# CRI CheckpointContainer nicht implementiert in MicroK8s
+crictl checkpoint --export=/tmp/cp.tar <container>
+# Fehler: method CheckpointContainer not implemented
+```
+
+#### Option B: runc restore (manuell)
+
+Erfordert:
+1. OCI-Bundle mit rootfs (vom Original-Image)
+2. config.json (Container-Konfiguration)
+3. Checkpoint-Verzeichnis mit CRIU-Images
+
+```bash
+# Voraussetzung: Bundle und Checkpoint extrahiert
+sudo CRIU_LIBS=/usr/local/lib/criu runc restore \
+    --bundle /path/to/bundle \
+    --image-path /tmp/gpu-restore/checkpoint \
+    --work /tmp/runc-work \
+    <container-id>
+```
+
+**Problem**: Erfordert manuelles Bundle-Setup, nicht Kubernetes-integriert.
+
+#### Option C: containerd Restore (experimentell)
+
+```bash
+# Theorie: ctr tasks start mit Checkpoint
+sudo /snap/microk8s/current/bin/ctr \
+    --namespace k8s.io \
+    --address /var/snap/microk8s/common/run/containerd.sock \
+    tasks start <container-id> --checkpoint <checkpoint-image>
+```
+
+**Status**: Noch nicht getestet für GPU-Workloads.
+
+### Bekannte Einschränkungen
+
+1. **Kubernetes-Integration fehlt**: K8s CRI unterstützt `CheckpointContainer` nicht in MicroK8s
+2. **nvidia-container-runtime**: Muss beim Restore die gleichen GPU-Devices injizieren
+3. **CUDA Context**: GPU muss beim Restore verfügbar sein (gleiche oder kompatible GPU)
+
+### Empfohlener Workflow für Production
+
+Für Task 06 (Phase 1) ist der **manuelle Checkpoint/Restore** Workflow ausreichend:
+
+1. **Checkpoint**: Über `ctr tasks checkpoint` (funktioniert ✓)
+2. **Restore**: Über separaten Operator/Controller außerhalb von K8s
+3. **Zukünftige Integration**: Custom CRI-Plugin oder Shim-Erweiterung
+
 ## Offene Fragen
 
 - [x] ~~Wie interagiert `nvidia-container-runtime` mit dem Checkpoint-Prozess?~~
   → Checkpoint funktioniert mit nvidia RuntimeClass, CRIU CUDA Plugin wird korrekt geladen
 - [ ] Müssen CUDA-Kontexte vor dem Checkpoint in einen bestimmten Zustand gebracht werden?
 - [ ] Funktioniert Restore auf einer anderen GPU (gleiches Modell)?
-- [ ] Wie wird der Restore-Workflow implementiert (Kubernetes CRI vs. manuell)?
+- [x] ~~Wie wird der Restore-Workflow implementiert (Kubernetes CRI vs. manuell)?~~
+  → CRI nicht implementiert in MicroK8s, manueller Restore via runc/ctr erforderlich
 
 ## Definition of Done
 
@@ -446,8 +523,9 @@ Alternativ kann das Checkpoint-Script verwendet werden:
 - [x] GPU-Checkpoint kann erstellt werden (via `ctr tasks checkpoint`)
 - [x] Checkpoint-Größe zeigt VRAM-Erfassung (2.2 GiB statt 4 MiB)
 - [x] Pod läuft nach Checkpoint weiter (kein Kill)
-- [ ] Shim erkennt GPU-Container (via Device-Requests oder Annotations)
-- [ ] Shim kann GPU-Container restoren (GPU wird wieder alloziert)
+- [x] Checkpoint-Struktur analysiert (CRIU-Images inkl. pages-7.img mit GPU-Speicher)
+- [ ] Shim erkennt GPU-Container (via Device-Requests oder Annotations) - *Deferred: nvidia RuntimeClass*
+- [ ] GPU-Restore via runc/ctr getestet - *Blocked: Manuelle Bundle-Erstellung erforderlich*
 - [ ] Applikations-Log beweist State-Erhalt (Counter läuft weiter, nicht Neustart)
 - [ ] `nvidia-smi` zeigt nach Restore die erwartete VRAM-Belegung
 
