@@ -95,17 +95,33 @@ Szenario: 3 große Modelle (A, B, C) auf einer GPU.
 
 ## 4. Implementierungsvorschlag
 
-### Phase 1: Core Shim & RAM Tiering (PoC)
-*   **Ziel**: Scale-to-Zero mit RAM-Resume.
-*   **Tech**: Fork von `zeropod`. Integration von `cuda-checkpoint`.
-*   **Storage**: Hardcoded `tmpfs` Mounts.
+### Phase 1: Foundation (abgeschlossen)
+*   **Ziel**: Proof of Concept für GPU-Checkpoint.
+*   **Ergebnisse**:
+    *   ✅ CRIU CUDA-Plugin funktioniert (2.2 GiB Checkpoint für 2GB VRAM)
+    *   ✅ containerd `ctr tasks checkpoint` erstellt valide Checkpoints
+    *   ⚠️ Shim-Integration für GPU nicht möglich (BinaryName-Limitation)
+    *   ⚠️ CRI CheckpointContainer API nicht in containerd implementiert
+*   **Architektur-Entscheidung**: GPU-Workloads nutzen `nvidia` RuntimeClass, Checkpoint/Restore über Operator
 
-### Phase 2: Storage Fabric & Persistence
+### Phase 2: Kybernate Operator (nächster Schritt)
+*   **Ziel**: Kubernetes-native Checkpoint/Restore ohne manuelle Intervention.
+*   **Tech**: Go-basierter Kubernetes Operator mit containerd gRPC Integration.
+*   **Warum Operator statt Shim?**:
+    *   containerd handhabt Bundle-Setup intern
+    *   `runc restore` wird korrekt aufgerufen (umgeht CRIU Mount-Bug)
+    *   CRDs ermöglichen deklaratives Management
+*   **CRDs**: 
+    *   `KybernateCheckpoint` - Checkpoint-Anforderung
+    *   `KybernateRestore` - Restore-Anforderung
+    *   `KybernateWorkload` - Managed GPU-Workload mit Auto-Suspend
+
+### Phase 3: Storage Fabric & Persistence
 *   **Ziel**: Migration und "Save Games".
-*   **Tech**: Erweiterung des Shims um S3-Upload/Download.
-*   **CRDs**: Einführung von `GpuCheckpoint` CRD zur Verwaltung von Snapshots.
+*   **Tech**: Erweiterung des Operators um S3-Upload/Download.
+*   **Storage**: Checkpoint-Images in OCI-Registry oder S3.
 
-### Phase 3: The Brain (Multiplexing)
+### Phase 4: The Brain (Multiplexing)
 *   **Ziel**: Over-Provisioning und intelligentes Scheduling.
 *   **Tech**: Komplexer K8s Controller, der Metriken (VRAM Usage, PCIe Bandwidth) nutzt, um Entscheidungen zu treffen.
 *   **Activator**: Erweiterung um Routing-Logik für mehrere Modelle hinter einer IP.
