@@ -17,12 +17,19 @@ import (
 )
 
 // Service wraps the runc shim to add checkpoint/restore capabilities.
+// 
+// Note on GPU support: This shim currently uses runc as the underlying runtime.
+// For GPU workloads, use the 'nvidia' RuntimeClass instead. GPU checkpoint/restore
+// is performed via CRIU with the cuda_plugin.so. See docs/RUNTIME_ARCHITECTURE.md
+// for the full architecture discussion.
 type Service struct {
 	shim.Shim
 }
 
 // New initializes the shim by delegating to the default runc shim.
 func New(ctx context.Context, id string, publisher shim.Publisher, shutdown func()) (shim.Shim, error) {
+	debugLog("Kybernate shim starting")
+
 	runcShim, err := runc.New(ctx, id, publisher, shutdown)
 	if err != nil {
 		return nil, err

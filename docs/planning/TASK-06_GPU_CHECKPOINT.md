@@ -47,18 +47,59 @@ Das Script `stress_gpu.py` alloziert ~2GB VRAM und zählt in einer Schleife hoch
 - `nvidia` für GPU-Device-Injection (nvidia-container-runtime)
 - `kybernate` für Checkpoint/Restore
 
-**Lösung**: Der Kybernate-Shim wird zum **Wrapper** für nvidia-container-runtime:
+**Lösung**: Der Kybernate-Shim wird zum **Smart Proxy**, der die passende OCI-Runtime des Clusters nutzt:
 
 ```
 Pod (runtimeClassName: kybernate)
   └─> containerd-shim-kybernate-v1
-        └─> nvidia-container-runtime (statt runc)
-              └─> runc
+        └─> Auto-Detect Runtime:
+              ├─> nvidia-container-runtime (wenn GPU vorhanden)
+              └─> runc (Fallback für CPU-only)
 ```
 
-**Umsetzung in `service.go`**:
-- Statt `runc` direkt aufzurufen, `nvidia-container-runtime` verwenden
-- Alternativ: Environment-Variable `NVIDIA_VISIBLE_DEVICES` manuell setzen
+**Implementierung - Runtime-Auswahl-Logik**:
+
+```go
+func getRuntimeBinary() string {
+    // 1. Explizite Konfiguration via Environment
+    if rt := os.Getenv("KYBERNATE_RUNTIME"); rt != "" {
+        return rt
+    }
+    
+    // 2. Auto-Detect nvidia-container-runtime
+    candidates := []string{
+        "nvidia-container-runtime",
+        "/usr/bin/nvidia-container-runtime",
+        "/usr/local/nvidia/toolkit/nvidia-container-runtime",
+    }
+    for _, c := range candidates {
+        if _, err := exec.LookPath(c); err == nil {
+            return c
+        }
+    }
+    
+    // 3. Fallback: runc
+    return "runc"
+}
+```
+
+**Voraussetzungen für GPU-Support**:
+
+Kybernate setzt voraus, dass der Cluster bereits GPU-fähig konfiguriert ist:
+1. NVIDIA GPU Operator ODER manuell installierter `nvidia-container-toolkit`
+2. `nvidia-container-runtime` im PATH
+3. containerd mit nvidia-runtime konfiguriert
+
+```bash
+# Validierung vor Kybernate-Nutzung mit GPU
+nvidia-container-runtime --version  # Muss existieren
+kubectl get runtimeclass nvidia     # Empfohlen zur Validierung
+```
+
+**Zukünftige Verbesserungen** (siehe `shim/docs/RUNTIME_ARCHITECTURE.md`):
+- Operator-basierte Validierung bei Installation
+- Helm Chart mit konfigurierbarer Runtime
+- Automatische RuntimeClass-Erstellung
 
 #### 2.2 Plugin Injection für CRIU
 
