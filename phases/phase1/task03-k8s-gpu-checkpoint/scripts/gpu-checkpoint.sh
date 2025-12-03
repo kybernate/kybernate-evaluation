@@ -90,14 +90,18 @@ create_checkpoint() {
 # Show checkpoint size
 show_checkpoint_info() {
     log_info "Checkpoint details:"
-    CHECKPOINT_SIZE=$(sudo $CTR $CTR_ARGS images ls 2>/dev/null | grep "checkpoint.*$CONTAINER_ID" | awk '{print $5}')
+    CHECKPOINT_LINE=$(sudo $CTR $CTR_ARGS images ls 2>/dev/null | grep "checkpoint.*$CONTAINER_ID" | tail -1)
+    CHECKPOINT_SIZE=$(echo "$CHECKPOINT_LINE" | awk '{print $5}')
     echo "  Size: $CHECKPOINT_SIZE"
     
-    if [[ "$CHECKPOINT_SIZE" == *"MiB"* ]] || [[ "$CHECKPOINT_SIZE" == *"GiB"* ]]; then
+    # Check if size indicates GPU memory was captured
+    if [[ "$CHECKPOINT_SIZE" == *"MiB"* ]]; then
         SIZE_NUM=$(echo "$CHECKPOINT_SIZE" | grep -oP '[\d.]+')
         if (( $(echo "$SIZE_NUM > 100" | bc -l) )); then
             log_info "Checkpoint includes GPU memory (size > 100 MiB)"
         fi
+    elif [[ "$CHECKPOINT_SIZE" == *"GiB"* ]]; then
+        log_info "Checkpoint includes GPU memory (size in GiB)"
     fi
 }
 
