@@ -102,6 +102,13 @@ Szenario: 3 große Modelle (A, B, C) auf einer GPU.
     *   ✅ containerd `ctr tasks checkpoint` erstellt valide Checkpoints
     *   ⚠️ Shim-Integration für GPU nicht möglich (BinaryName-Limitation)
     *   ⚠️ CRI CheckpointContainer API nicht in containerd implementiert
+    *   🎉 **Two-Stage GPU Checkpoint validiert!** (Durchbruch 2025-12-03)
+*   **Two-Stage Checkpoint** (cuda-checkpoint + CRIU):
+    1. `cuda-checkpoint --action checkpoint` → VRAM in Host-RAM (Driver API)
+    2. `containerd tasks checkpoint` → RAM + CPU auf Disk (CRIU)
+    3. Restore umgekehrt: Disk → RAM → VRAM
+    *   Prozess ~5 Minuten pausiert, Loop 485 → 490 exakt fortgesetzt
+    *   Umgeht alle bekannten CRIU Mount-Bugs!
 *   **Architektur-Entscheidung**: GPU-Workloads nutzen `nvidia` RuntimeClass, Checkpoint/Restore über Operator
 
 ### Phase 2: Kybernate Operator (nächster Schritt)
