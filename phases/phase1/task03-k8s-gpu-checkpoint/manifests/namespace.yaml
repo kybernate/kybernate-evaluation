@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kybernate-system
+  labels:
+    kybernate.io/phase: "1"
+    kybernate.io/task: "03"

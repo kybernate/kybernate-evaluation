@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pytorch-stress
+  namespace: kybernate-system
+  labels:
+    app: pytorch-stress
+spec:
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  containers:
+    - name: runner
+      image: localhost:32000/gpu-pytorch:v1
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c", "python /workspace/scripts/stress_gpu.py"]
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+      volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+  volumes:
+    - name: workspace
+      hostPath:
+        path: /home/andre/Workspace/kybernate/phases/phase1/task03-k8s-gpu-checkpoint/workspace
+        type: DirectoryOrCreate

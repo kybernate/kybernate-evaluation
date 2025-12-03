@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-test
+  namespace: kybernate-system
+spec:
+  runtimeClassName: kybernate
+  containers:
+  - name: counter
+    image: python:3.9-slim
+    command: ["python3", "-c", "import time, os; i=0;\nwhile True:\n  print(f'Counter: {i} | PID: {os.getpid()}', flush=True)\n  i+=1\n  time.sleep(1)"]

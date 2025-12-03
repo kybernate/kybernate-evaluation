@@ -1,0 +1,6 @@
+artifacts/
+logs/
+workspace/__pycache__/
+workspace/gpu-pytorch-v1.tar
+workspace/*.log
+workspace/artifacts/

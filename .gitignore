@@ -1,0 +1,18 @@
+# Binaries
+/shim/bin/
+/shim/dist/
+
+# Go
+/shim/vendor/
+go.work
+
+# IDEs
+#.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+/logs/
+/artifacts/
