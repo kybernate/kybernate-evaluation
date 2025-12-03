@@ -16,3 +16,4 @@ go.work
 *.log
 /logs/
 /artifacts/
+.task06-steps.md

@@ -29,7 +29,11 @@ sudo docker save localhost:32000/gpu-pytorch:v1 -o gpu-pytorch-v1.tar
 microk8s ctr image import gpu-pytorch-v1.tar
 rm gpu-pytorch-v1.tar
 
-# Verifizieren
+# Verifizieren (Option A: Registry API)
+curl -s http://localhost:32000/v2/gpu-pytorch/tags/list
+# Erwartete Ausgabe: {"name":"gpu-pytorch","tags":["v1"]}
+
+# Verifizieren (Option B: containerd)
 microk8s ctr images ls | grep gpu-pytorch
 ```
 
@@ -110,6 +114,55 @@ func (s *Service) Checkpoint(ctx context.Context, req *task.CheckpointTaskReques
 ```
 
 ### 3. Verifikation
+
+#### 3.1 Voraussetzung: GPU mit nvidia RuntimeClass testen
+
+Bevor der Kybernate-Shim für GPU angepasst wird, verifizieren dass GPU-Pods grundsätzlich funktionieren:
+
+```bash
+# GPU-Pod mit nvidia RuntimeClass (ohne Kybernate)
+microk8s kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-test-nvidia
+  namespace: kybernate-system
+spec:
+  runtimeClassName: nvidia
+  containers:
+  - name: pytorch
+    image: localhost:32000/gpu-pytorch:v1
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+    volumeMounts:
+    - name: scripts
+      mountPath: /workspace/scripts
+  volumes:
+  - name: scripts
+    hostPath:
+      path: /home/andre/Workspace/kybernate-evaluation/phases/phase1/task03-k8s-gpu-checkpoint/workspace/scripts
+      type: Directory
+EOF
+
+# Warten und Logs prüfen
+microk8s kubectl wait --for=condition=Ready pod/gpu-test-nvidia -n kybernate-system --timeout=60s
+microk8s kubectl logs gpu-test-nvidia -n kybernate-system --tail=10
+# Erwartete Ausgabe: "Loop 0: Wert=2.0, VRAM=1908.00 MB", etc.
+
+# VRAM-Belegung prüfen
+nvidia-smi | grep python
+# Erwartete Ausgabe: ~2000MiB belegt
+
+# Aufräumen
+microk8s kubectl delete pod gpu-test-nvidia -n kybernate-system
+```
+
+**Hinweis**: Mit `runtimeClassName: kybernate` funktioniert GPU-Zugriff zunächst NICHT, da der Shim `runc` statt `nvidia-container-runtime` verwendet. Dies wird in Schritt 2.1 (RuntimeClass-Strategie) behoben.
+
+#### 3.2 GPU-Pod mit Kybernate RuntimeClass
+
+Nach der Shim-Anpassung:
 
 ```bash
 # 1. GPU-Pod deployen
