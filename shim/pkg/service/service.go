@@ -12,6 +12,8 @@ import (
 	"time"
 
 	task "github.com/containerd/containerd/api/runtime/task/v2"
+	// Import runc options to register the protobuf type
+	_ "github.com/containerd/containerd/api/types/runc/options"
 	runc "github.com/containerd/containerd/runtime/v2/runc/v2"
 	"github.com/containerd/containerd/runtime/v2/shim"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -62,20 +64,102 @@ func New(ctx context.Context, id string, publisher shim.Publisher, shutdown func
 	return svc, nil
 }
 
+// Options represents runtime options for the container
+type Options struct {
+	BinaryName    string `json:"binary_name,omitempty"`
+	Root          string `json:"root,omitempty"`
+	SystemdCgroup bool   `json:"systemd_cgroup,omitempty"`
+}
+
+// hasGPUResources checks if the OCI spec requests GPU resources
+func hasGPUResources(spec *specs.Spec) bool {
+	// Check for nvidia.com/gpu in Linux resources
+	if spec.Linux != nil && spec.Linux.Resources != nil {
+		for _, device := range spec.Linux.Resources.Devices {
+			if device.Allow && device.Major != nil && *device.Major == 195 {
+				// 195 is the major number for nvidia devices
+				return true
+			}
+		}
+	}
+
+	// Check annotations for GPU requests
+	if spec.Annotations != nil {
+		if _, ok := spec.Annotations["io.kubernetes.cri.nvidia-gpu-quantity"]; ok {
+			return true
+		}
+	}
+
+	// Check process environment for NVIDIA-related vars
+	if spec.Process != nil {
+		for _, env := range spec.Process.Env {
+			if strings.HasPrefix(env, "NVIDIA_VISIBLE_DEVICES=") ||
+				strings.HasPrefix(env, "NVIDIA_DRIVER_CAPABILITIES=") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// ensureNvidiaRuntime writes options.json to use nvidia-container-runtime if GPU is requested
+func ensureNvidiaRuntime(bundlePath string, spec *specs.Spec) error {
+	if !hasGPUResources(spec) {
+		return nil
+	}
+
+	// Check if nvidia-container-runtime is available
+	if _, err := exec.LookPath("nvidia-container-runtime"); err != nil {
+		debugLog("nvidia-container-runtime not found, using default runtime")
+		return nil
+	}
+
+	optionsPath := filepath.Join(bundlePath, "options.json")
+
+	// Check if options.json already exists
+	if data, err := os.ReadFile(optionsPath); err == nil {
+		var opts Options
+		if err := json.Unmarshal(data, &opts); err == nil {
+			if opts.BinaryName != "" {
+				debugLog(fmt.Sprintf("options.json already has BinaryName: %s", opts.BinaryName))
+				return nil
+			}
+		}
+	}
+
+	// Write options.json with nvidia-container-runtime
+	opts := Options{
+		BinaryName: "nvidia-container-runtime",
+	}
+	data, err := json.Marshal(opts)
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(optionsPath, data, 0644); err != nil {
+		return err
+	}
+
+	debugLog("Wrote options.json with nvidia-container-runtime for GPU workload")
+	return nil
+}
+
 // Create intercepts the container creation to check for restore annotations.
 func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*task.CreateTaskResponse, error) {
 	debugLog(fmt.Sprintf("Create called. Bundle: %s", req.Bundle))
 
 	isRestore := false
 	checkpointPath := ""
+	var spec *specs.Spec
 
 	// Check for restore annotation in the OCI spec
 	if req.Bundle != "" {
 		configPath := filepath.Join(req.Bundle, "config.json")
 		data, err := os.ReadFile(configPath)
 		if err == nil {
-			var spec specs.Spec
-			if err := json.Unmarshal(data, &spec); err == nil {
+			spec = &specs.Spec{}
+			if err := json.Unmarshal(data, spec); err == nil {
 				// Check for restore annotation
 				if cp, ok := spec.Annotations["kybernate.io/restore-from"]; ok {
 					req.Checkpoint = cp
@@ -96,6 +180,11 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 							break
 						}
 					}
+				}
+
+				// Ensure nvidia-container-runtime is used for GPU workloads
+				if err := ensureNvidiaRuntime(req.Bundle, spec); err != nil {
+					debugLog(fmt.Sprintf("Failed to set nvidia-container-runtime: %v", err))
 				}
 			}
 		}
