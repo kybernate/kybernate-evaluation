@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-ckpt-test
+  namespace: kybernate-system
+spec:
+  runtimeClassName: nvidia
+  restartPolicy: Never
+  containers:
+  - name: cuda
+    image: pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      python3 -u << 'PYTHON'
+      import time
+      import torch
+      
+      device = torch.device('cuda')
+      tensor = torch.zeros(512 * 1024 * 1024, dtype=torch.float32, device=device)
+      print(f'Allocated {tensor.numel() * 4 / 1024**3:.2f} GB on GPU', flush=True)
+      
+      counter = 0
+      while True:
+          counter += 1
+          tensor[0] = counter
+          val = tensor[0].item()
+          print(f'Loop {counter}: value={val}', flush=True)
+          time.sleep(5)
+      PYTHON
+    resources:
+      limits:
+        nvidia.com/gpu: 1

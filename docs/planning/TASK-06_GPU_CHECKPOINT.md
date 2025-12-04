@@ -1,8 +1,240 @@
 # Task 06: GPU Checkpoint Implementation
 
-**Status**: ✅ Phase 1 Complete (Checkpoint funktioniert, Restore-Analyse abgeschlossen)
-**Phase**: 1 (Foundation)
-**Letzte Aktualisierung**: 2025-12-03
+**Status**: 🔄 Phase 2 In Progress (Shim-Integration)
+**Phase**: 2 (Integration)
+**Letzte Aktualisierung**: 2025-12-04
+
+## Two-Stage GPU Checkpoint Architektur
+
+GPU-Checkpointing erfordert eine **zweistufige Strategie**, da CRIU nicht direkt auf VRAM zugreifen kann:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     KYBERNATE GPU CHECKPOINT                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Stage 1: CUDA Checkpoint (VRAM → Host RAM)                        │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  1. cuCheckpointProcessLock(pid)      → Block CUDA calls    │   │
+│  │  2. cuCheckpointProcessCheckpoint(pid) → VRAM → RAM copy    │   │
+│  │     (GPU memory now in host RAM, process paused)            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  Stage 2: CRIU Checkpoint (Host RAM → Disk)                        │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  3. runc checkpoint / criu dump                              │   │
+│  │     - Dumps process memory (incl. GPU data in RAM)           │   │
+│  │     - Creates pages-*.img files (2+ GB for GPU workloads)    │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  [Container can be killed / migrated / restored later]             │
+│                              ↓                                      │
+│  Stage 3: CRIU Restore (Disk → Host RAM)                           │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  4. runc restore / criu restore                              │   │
+│  │     - Restores process memory from disk                      │   │
+│  │     - GPU data is in host RAM, VRAM still empty              │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  Stage 4: CUDA Restore (Host RAM → VRAM)                           │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  5. cuCheckpointProcessRestore(pid)   → RAM → VRAM copy     │   │
+│  │  6. cuCheckpointProcessUnlock(pid)    → Resume CUDA calls   │   │
+│  │     (Process continues where it left off)                    │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Validierte Tests (2025-12-04)
+
+| Test | Ergebnis | Details |
+|------|----------|---------|
+| CUDA Lock | ✅ | `cuCheckpointProcessLock` blockiert CUDA-Aufrufe |
+| VRAM → RAM | ✅ | VRAM fällt auf 0 MiB, Daten im Host-RAM |
+| CRIU Dump | ✅ | 2.3 GiB Checkpoint inkl. GPU-Daten |
+| RAM → VRAM | ✅ | `cuCheckpointProcessRestore` stellt VRAM wieder her |
+| Prozess läuft weiter | ✅ | Counter zählt nach Restore weiter |
+
+### Go CUDA Bindings
+
+Implementiert in `pkg/cuda/checkpoint.go`:
+
+```go
+// Direct CUDA Driver API calls via cgo
+checkpointer, _ := cuda.NewCheckpointer()
+
+// Full checkpoint cycle
+checkpointer.CheckpointFull(pid, timeoutMs)  // Lock + VRAM→RAM
+checkpointer.RestoreFull(pid)                 // RAM→VRAM + Unlock
+
+// Individual operations
+checkpointer.Lock(pid, timeout)
+checkpointer.Checkpoint(pid)
+checkpointer.Restore(pid)
+checkpointer.Unlock(pid)
+checkpointer.GetState(pid)  // running/locked/checkpointed
+```
+
+CLI-Tool: `bin/cuda-ckpt` für manuelle Tests.
+
+---
+
+## Shim-Integration
+
+### Architektur-Übersicht
+
+Der Kybernate-Shim erweitert den Standard containerd-shim um GPU-Checkpoint-Fähigkeiten:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        KYBERNATE SHIM                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  containerd                                                         │
+│      ↓                                                              │
+│  containerd-shim-kybernate-v1                                       │
+│      │                                                              │
+│      ├─→ Checkpoint() ─────────────────────────────────────────┐    │
+│      │       │                                                 │    │
+│      │       ├─ 1. Detect GPU process (nvidia-smi)             │    │
+│      │       ├─ 2. CUDA checkpoint (via pkg/cuda)              │    │
+│      │       │      cuCheckpointProcessLock()                  │    │
+│      │       │      cuCheckpointProcessCheckpoint()            │    │
+│      │       ├─ 3. Delegate to runc.Checkpoint()               │    │
+│      │       └─ 4. Store checkpoint path for restore           │    │
+│      │                                                         │    │
+│      └─→ Create() (with restore) ──────────────────────────────┤    │
+│              │                                                 │    │
+│              ├─ 1. Delegate to runc.Create() with checkpoint   │    │
+│              ├─ 2. Find restored GPU process                   │    │
+│              ├─ 3. CUDA restore (via pkg/cuda)                 │    │
+│              │      cuCheckpointProcessRestore()               │    │
+│              │      cuCheckpointProcessUnlock()                │    │
+│              └─ 4. Process continues execution                 │    │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Implementierung: `pkg/service/service.go`
+
+```go
+// Key additions to the shim:
+
+// 1. GPU detection
+func detectGPUProcess(containerID string) (int, bool) {
+    // Parse nvidia-smi output to find GPU process PID
+    // Returns (pid, hasGPU)
+}
+
+// 2. Enhanced Checkpoint
+func (s *Service) Checkpoint(ctx context.Context, req *task.CheckpointTaskRequest) {
+    // Check for GPU process
+    if pid, hasGPU := detectGPUProcess(containerID); hasGPU {
+        // Stage 1: CUDA checkpoint
+        checkpointer.CheckpointFull(pid, 30000)
+    }
+    
+    // Stage 2: CRIU checkpoint (via runc)
+    return s.Shim.Checkpoint(ctx, req)
+}
+
+// 3. Enhanced Create (restore)
+func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) {
+    // Delegate to runc (handles CRIU restore)
+    resp, err := s.Shim.Create(ctx, req)
+    
+    // If restoring and has GPU
+    if req.Checkpoint != "" {
+        if pid, hasGPU := detectGPUProcess(containerID); hasGPU {
+            // Stage 4: CUDA restore
+            checkpointer.RestoreFull(pid)
+        }
+    }
+    return resp, err
+}
+```
+
+### GPU-Erkennung
+
+GPU-Prozesse werden über `nvidia-smi` identifiziert:
+
+```bash
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
+# Output: 283403, 2184 MiB
+```
+
+Der Shim korreliert PIDs mit Container-Prozessen über `/proc/<pid>/cgroup`.
+
+### Checkpoint-Speicherung
+
+Checkpoints werden in containerd's Content Store gespeichert:
+
+```
+/var/snap/microk8s/common/var/lib/containerd/
+  io.containerd.content.v1.content/blobs/sha256/<hash>
+```
+
+Für Restore wird der Checkpoint-Pfad via:
+1. Annotation: `kybernate.io/restore-from`
+2. Environment: `RESTORE_FROM=/path/to/checkpoint`
+
+---
+
+## Validierte Tests (2025-12-04)
+
+### CUDA Checkpoint/Restore Zyklus ✅
+
+```bash
+# 1. GPU Pod starten (nvidia RuntimeClass)
+microk8s kubectl apply -f manifests/gpu-ckpt-test.yaml
+
+# 2. GPU-Prozess identifizieren
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+# Output: 342458, 2184 MiB
+
+# 3. CUDA Checkpoint (VRAM → RAM)
+sudo ./bin/cuda-ckpt --action full-checkpoint --pid 342458 --timeout 30000
+# Output: Full checkpoint complete - VRAM is now in host RAM
+# nvidia-smi: 0 MiB (VRAM freigegeben)
+
+# 4. CUDA Restore (RAM → VRAM)
+sudo ./bin/cuda-ckpt --action full-restore --pid 342458
+# Output: Full restore complete - process is running
+# nvidia-smi: 2184 MiB (VRAM wiederhergestellt)
+
+# 5. Pod läuft weiter (Loop 4 → 8, keine Unterbrechung)
+```
+
+### Shim GPU-Integration ✅
+
+Der Shim wurde um folgende Komponenten erweitert:
+
+| Datei | Funktion |
+|-------|----------|
+| `shim/pkg/cuda/checkpoint.go` | CUDA Driver API Bindings (cgo) |
+| `shim/pkg/cuda/detect.go` | GPU-Prozess-Erkennung via nvidia-smi |
+| `shim/pkg/service/service.go` | Integration in Checkpoint/Create Methoden |
+
+**Build und Installation:**
+```bash
+cd shim
+go build -o ../bin/containerd-shim-kybernate-v1 ./cmd/containerd-shim-kybernate-v1/
+sudo cp ../bin/containerd-shim-kybernate-v1 /var/snap/microk8s/common/
+```
+
+### Bekannte Einschränkungen
+
+1. **RuntimeClass-Konflikt**: Der `kybernate-gpu` RuntimeClass funktioniert nicht direkt, da der Shim die nvidia-container-runtime nicht korrekt einbindet
+2. **Workaround**: GPU-Pods mit `nvidia` RuntimeClass deployen, Checkpoint manuell via CLI
+
+### Nächste Schritte
+
+- [ ] Shim um nvidia-container-runtime Proxy erweitern
+- [ ] Vollständiger Container Checkpoint/Restore Test (CRIU + CUDA)
+- [ ] Kubernetes-Integration für automatische Checkpoint-Trigger
+
+---
 
 ## Ziel
 Erweiterung des `shim-kybernate-v1` Shims um die Unterstützung für GPU-beschleunigte Container (CUDA). Dies baut auf der erfolgreichen CPU-Checkpoint-Implementierung (Task 05) auf.
