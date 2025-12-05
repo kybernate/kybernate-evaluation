@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-restore-debug
+  namespace: kybernate-system
+  annotations:
+    kybernate.io/restore-from: "/var/lib/kybernate/checkpoints/kybernate-system/gpu-ckpt-test/cuda/20251205-013941"
+spec:
+  runtimeClassName: kybernate
+  restartPolicy: OnFailure
+  containers:
+  - name: main
+    image: pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+    env:
+    - name: RESTORE_FROM
+      value: "/var/lib/kybernate/checkpoints/kybernate-system/gpu-ckpt-test/cuda/20251205-013941"
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+        memory: "4Gi"
+        cpu: "2"
+      requests:
+        nvidia.com/gpu: 1
+        memory: "4Gi"
+        cpu: "2"
+    securityContext:
+      privileged: true

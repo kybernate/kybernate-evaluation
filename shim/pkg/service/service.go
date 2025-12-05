@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,10 +14,11 @@ import (
 
 	task "github.com/containerd/containerd/api/runtime/task/v2"
 	// Import runc options to register the protobuf type
-	_ "github.com/containerd/containerd/api/types/runc/options"
+	runcoptions "github.com/containerd/containerd/api/types/runc/options"
 	runc "github.com/containerd/containerd/runtime/v2/runc/v2"
 	"github.com/containerd/containerd/runtime/v2/shim"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/kybernate/kybernate/pkg/cuda"
@@ -183,8 +185,42 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 				}
 
 				// Ensure nvidia-container-runtime is used for GPU workloads
-				if err := ensureNvidiaRuntime(req.Bundle, spec); err != nil {
-					debugLog(fmt.Sprintf("Failed to set nvidia-container-runtime: %v", err))
+				if hasGPUResources(spec) {
+					// Try to modify req.Options (protobuf)
+					if req.Options != nil {
+						v, err := req.Options.UnmarshalNew()
+						if err == nil {
+							if opts, ok := v.(*runcoptions.Options); ok {
+								opts.BinaryName = "nvidia-container-runtime"
+								newOpts, err := anypb.New(opts)
+								if err == nil {
+									req.Options = newOpts
+									debugLog("Switched runtime binary to nvidia-container-runtime via protobuf")
+								} else {
+									debugLog(fmt.Sprintf("Failed to marshal new options: %v", err))
+								}
+							}
+						} else {
+							debugLog(fmt.Sprintf("Failed to unmarshal options: %v", err))
+						}
+					} else {
+						// Create new options if nil
+						opts := &runcoptions.Options{
+							BinaryName: "nvidia-container-runtime",
+						}
+						newOpts, err := anypb.New(opts)
+						if err == nil {
+							req.Options = newOpts
+							debugLog("Created new options with nvidia-container-runtime")
+						} else {
+							debugLog(fmt.Sprintf("Failed to marshal new options (from nil): %v", err))
+						}
+					}
+
+					// Also try the options.json method as fallback/complement
+					if err := ensureNvidiaRuntime(req.Bundle, spec); err != nil {
+						debugLog(fmt.Sprintf("Failed to set nvidia-container-runtime via options.json: %v", err))
+					}
 				}
 			}
 		}
@@ -203,26 +239,104 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 		// Wait a moment for the process to start
 		time.Sleep(500 * time.Millisecond)
 
-		// Find GPU process in the restored container
-		if gpuPID, hasGPU := cuda.FindAnyGPUProcessForTask(int(resp.Pid)); hasGPU {
-			debugLog(fmt.Sprintf("Found GPU process %d, performing CUDA restore", gpuPID))
+		restored := false
+		initPID := int(resp.Pid)
 
-			// Check if process is in checkpointed state
-			state, err := s.cudaCheckpointer.GetState(gpuPID)
-			if err != nil {
-				debugLog(fmt.Sprintf("Failed to get CUDA state for PID %d: %v", gpuPID, err))
-			} else if state == cuda.StateCheckpointed {
-				// Perform CUDA restore: Host RAM → VRAM
-				if err := s.cudaCheckpointer.RestoreFull(gpuPID); err != nil {
-					debugLog(fmt.Sprintf("CUDA restore failed for PID %d: %v", gpuPID, err))
+		// If resp.Pid is 0 (which happens with some runtimes/restore flows), try to resolve it from the bundle
+		if initPID <= 0 {
+			debugLog(fmt.Sprintf("resp.Pid was %d, trying to resolve from bundle: %s", initPID, req.Bundle))
+
+			for i := 0; i < 50; i++ { // Retry for up to 10 seconds
+				// 1. Try init.pid in the bundle directory (most reliable)
+				pidPath := filepath.Join(req.Bundle, "init.pid")
+				data, err := os.ReadFile(pidPath)
+				if err == nil {
+					pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+					if err == nil && pid > 0 {
+						initPID = pid
+						debugLog(fmt.Sprintf("Resolved PID %d from %s after retry %d", initPID, pidPath, i))
+						break
+					}
 				} else {
-					debugLog(fmt.Sprintf("CUDA restore successful for PID %d - VRAM restored", gpuPID))
+					if i%10 == 0 {
+						debugLog(fmt.Sprintf("Failed to read %s: %v", pidPath, err))
+						// List directory contents to debug
+						entries, _ := os.ReadDir(req.Bundle)
+						var names []string
+						for _, e := range entries {
+							names = append(names, e.Name())
+						}
+						debugLog(fmt.Sprintf("Bundle contents: %v", names))
+					}
+				}
+
+				// 2. Fallback: Try getTaskPID which checks standard locations
+				if pid := s.getTaskPID(req.ID); pid > 0 {
+					initPID = pid
+					debugLog(fmt.Sprintf("Resolved PID %d from getTaskPID after retry %d", initPID, i))
+					break
+				}
+
+				// 3. Deep Fallback: Scan cgroups (expensive but necessary for some runtimes)
+				if i > 5 { // Only try this after a few quick failures
+					if pid := s.findPIDFromCgroup(req.ID); pid > 0 {
+						initPID = pid
+						debugLog(fmt.Sprintf("Resolved PID %d from cgroup scan after retry %d", initPID, i))
+						break
+					}
+				}
+
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+
+		// Try to check the init process directly first (nvidia-smi might not show it if VRAM is 0)
+		if initPID > 0 {
+			state, err := s.cudaCheckpointer.GetState(initPID)
+			if err == nil && state == cuda.StateCheckpointed {
+				debugLog(fmt.Sprintf("Found checkpointed process %d (init), performing CUDA restore", initPID))
+				if err := s.cudaCheckpointer.RestoreFull(initPID); err != nil {
+					debugLog(fmt.Sprintf("CUDA restore failed for PID %d: %v", initPID, err))
+				} else {
+					debugLog(fmt.Sprintf("CUDA restore successful for PID %d - VRAM restored", initPID))
+					restored = true
 				}
 			} else {
-				debugLog(fmt.Sprintf("GPU process %d not in checkpointed state (state=%s), skipping CUDA restore", gpuPID, state))
+				debugLog(fmt.Sprintf("Init process %d state: %s (err: %v)", initPID, state, err))
 			}
 		} else {
-			debugLog("No GPU process found in restored container")
+			debugLog("Could not resolve init PID")
+			return nil, fmt.Errorf("failed to resolve init PID for container %s", req.ID)
+		}
+
+		if !restored {
+			// Fallback: Find GPU process in the restored container via nvidia-smi
+			// Use initPID if available, otherwise 0 (which might fail)
+			searchPID := initPID
+			if searchPID == 0 {
+				searchPID = int(resp.Pid)
+			}
+
+			if gpuPID, hasGPU := cuda.FindAnyGPUProcessForTask(searchPID); hasGPU {
+				debugLog(fmt.Sprintf("Found GPU process %d via nvidia-smi, performing CUDA restore", gpuPID))
+
+				// Check if process is in checkpointed state
+				state, err := s.cudaCheckpointer.GetState(gpuPID)
+				if err != nil {
+					debugLog(fmt.Sprintf("Failed to get CUDA state for PID %d: %v", gpuPID, err))
+				} else if state == cuda.StateCheckpointed {
+					// Perform CUDA restore: Host RAM → VRAM
+					if err := s.cudaCheckpointer.RestoreFull(gpuPID); err != nil {
+						debugLog(fmt.Sprintf("CUDA restore failed for PID %d: %v", gpuPID, err))
+					} else {
+						debugLog(fmt.Sprintf("CUDA restore successful for PID %d - VRAM restored", gpuPID))
+					}
+				} else {
+					debugLog(fmt.Sprintf("GPU process %d not in checkpointed state (state=%s), skipping CUDA restore", gpuPID, state))
+				}
+			} else {
+				debugLog("No GPU process found in restored container")
+			}
 		}
 	}
 
@@ -280,8 +394,7 @@ func (s *Service) Checkpoint(ctx context.Context, req *task.CheckpointTaskReques
 
 // getTaskPID returns the PID of the container's init process
 func (s *Service) getTaskPID(containerID string) int {
-	// Read PID from containerd's task state
-	// This is a simplified approach - in production, use containerd API
+	// 1. Try reading PID from containerd's task state files
 	pidFiles := []string{
 		filepath.Join("/run/containerd/io.containerd.runtime.v2.task/k8s.io", containerID, "init.pid"),
 		filepath.Join("/var/snap/microk8s/common/run/containerd/io.containerd.runtime.v2.task/k8s.io", containerID, "init.pid"),
@@ -297,7 +410,77 @@ func (s *Service) getTaskPID(containerID string) int {
 		}
 	}
 
+	// 2. Fallback: Try querying runc state directly
+	// We try both standard runc and nvidia-container-runtime locations/binaries
+	runcRoots := []string{
+		"/run/containerd/runc/k8s.io",
+		"/var/snap/microk8s/common/run/containerd/runc/k8s.io",
+	}
+
+	binaries := []string{"runc", "nvidia-container-runtime", "/snap/microk8s/current/bin/runc"}
+
+	for _, root := range runcRoots {
+		for _, bin := range binaries {
+			cmd := exec.Command(bin, "--root", root, "state", containerID)
+			output, err := cmd.Output()
+			if err == nil {
+				var state struct {
+					InitProcessPID int `json:"init_process_pid"`
+				}
+				if err := json.Unmarshal(output, &state); err == nil && state.InitProcessPID > 0 {
+					return state.InitProcessPID
+				}
+			}
+		}
+	}
+
 	debugLog(fmt.Sprintf("Could not find init.pid for container %s", containerID))
+	return 0
+}
+
+func (s *Service) findPIDFromCgroup(containerID string) int {
+	// Scan /proc to find a process belonging to the container's cgroup
+	// This is expensive but reliable if the runtime hides the PID
+	// We look for cgroup paths containing the container ID
+
+	procDirs, err := os.ReadDir("/proc")
+	if err != nil {
+		debugLog(fmt.Sprintf("Failed to read /proc: %v", err))
+		return 0
+	}
+
+	for _, d := range procDirs {
+		if !d.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(d.Name())
+		if err != nil {
+			continue
+		}
+
+		cgroupPath := filepath.Join("/proc", d.Name(), "cgroup")
+		f, err := os.Open(cgroupPath)
+		if err != nil {
+			// debugLog(fmt.Sprintf("Failed to open %s: %v", cgroupPath, err))
+			continue
+		}
+
+		scanner := bufio.NewScanner(f)
+		found := false
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, containerID) {
+				found = true
+				debugLog(fmt.Sprintf("Found PID %d in cgroup matching %s: %s", pid, containerID, line))
+				break
+			}
+		}
+		f.Close()
+
+		if found {
+			return pid
+		}
+	}
 	return 0
 }
 
