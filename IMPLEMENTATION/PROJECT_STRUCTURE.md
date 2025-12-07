@@ -27,7 +27,7 @@ kybernate/
 │   │   ├── agent/          # Agent gRPC proto
 │   │   └── v1alpha1/       # CRD Go structs (kubebuilder)
 │   ├── checkpoint/         # Checkpoint logic
-│   │   ├── cuda/           # CUDA API wrapper
+│   │   ├── cuda/           # CUDA API wrapper (CGO, uses libcuda.so directly)
 │   │   └── criu/           # CRIU wrapper
 │   ├── runtime/            # Shim logic & Containerd interaction
 │   ├── storage/            # Storage Tiering (S3, NVMe, RAM)

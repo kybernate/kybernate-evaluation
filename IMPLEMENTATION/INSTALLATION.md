@@ -88,7 +88,9 @@ sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-## 4) CUDA checkpoint utility
+## 4) CUDA checkpoint utility (Optional / Reference)
+
+> **Note:** The Kybernate Node Agent uses the CUDA Driver API directly via CGO. The `cuda-checkpoint` binary is **not required** for the agent to function, but is useful for manual testing and debugging of driver capabilities.
 
 ```bash
 cd ~

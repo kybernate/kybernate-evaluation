@@ -79,3 +79,18 @@ Shim -> runtime: unpause
 - `CheckpointRequest` CRD (Spec: target Pod, policyRef, priority, deadlineMs)
 - `RestoreRequest` CRD (Spec: checkpointRef, targetNode/Group/Seat, warmupLevel)
 - `RebalanceRequest` CRD (Spec: sourceNode/Group, targetNode/Group, reason)
+
+## Implementation Details: CUDA Driver API
+
+**WICHTIG:** Der Node-Agent darf **nicht** das `cuda-checkpoint` Binary wrappen oder aufrufen.
+Stattdessen muss die **NVIDIA CUDA Driver API** direkt via CGO angesprochen werden.
+
+Referenz: [CUDA Driver API - Checkpoint](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CHECKPOINT.html)
+
+Die Implementierung in `pkg/checkpoint/cuda` muss folgende C-Funktionen binden:
+*   `cuCheckpointSave` (zum Erstellen des VRAM-Dumps)
+*   `cuCheckpointRestore` (zum Wiederherstellen)
+*   `cuCtxCreate` / `cuCtxDestroy` (Kontext-Management)
+
+Dies ermöglicht eine feingranulare Kontrolle über den Checkpoint-Prozess, besseres Error-Handling und vermeidet die Abhängigkeit von externen Binaries im Container/Host.
+

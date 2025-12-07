@@ -33,6 +33,8 @@ Hinweise zur Installation: Siehe `INSTALLATION.md`.
 - [Failure Recovery](FAILURE_RECOVERY.md) (Error Handling Strategies)
 - [Project Structure](PROJECT_STRUCTURE.md) (Go Module & Directory Layout)
 - [Makefile](Makefile) (Build Automation)
+- [Container Engine Integration](CONTAINER_ENGINE_INTEGRATION.md) (Containerd API vs. Runc/CRIU)
+- [Restore Flow & Portability](RESTORE_FLOW.md) (Cross-Node/Cross-GPU Details)
 
 ## Test Workload
 Ein GPU-Stress-Test Container steht bereit, um Checkpoint/Restore zu validieren.
