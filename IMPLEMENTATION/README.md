@@ -31,6 +31,8 @@ Hinweise zur Installation: Siehe `INSTALLATION.md`.
 - [API Specification](API_SPEC.md) (gRPC Proto)
 - [Artifact Layout](ARTIFACT_LAYOUT.md) (File Structure & Metadata)
 - [Failure Recovery](FAILURE_RECOVERY.md) (Error Handling Strategies)
+- [Project Structure](PROJECT_STRUCTURE.md) (Go Module & Directory Layout)
+- [Makefile](Makefile) (Build Automation)
 
 ## Test Workload
 Ein GPU-Stress-Test Container steht bereit, um Checkpoint/Restore zu validieren.
