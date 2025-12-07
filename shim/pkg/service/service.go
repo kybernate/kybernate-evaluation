@@ -323,6 +323,20 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 		return resp, err
 	}
 
+	candidateIDs := []string{}
+	candidateIDs = appendCandidate(candidateIDs, req.ID)
+	if bundleID := filepath.Base(req.Bundle); bundleID != "" {
+		candidateIDs = appendCandidate(candidateIDs, bundleID)
+	}
+
+	if spec != nil && spec.Annotations != nil {
+		if sid, ok := spec.Annotations["io.kubernetes.cri.sandbox-id"]; ok {
+			candidateIDs = appendCandidate(candidateIDs, sid)
+		}
+	}
+
+	candidateIDs = expandCandidatePrefixes(candidateIDs)
+
 	// If this was a restore and we have GPU support, perform CUDA restore
 	if isRestore && s.cudaCheckpointer != nil {
 		debugLog(fmt.Sprintf("Checking for GPU process to restore (checkpoint: %s)", checkpointPath))
@@ -337,7 +351,7 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 		if initPID <= 0 {
 			debugLog(fmt.Sprintf("resp.Pid was %d, trying to resolve from bundle: %s", initPID, req.Bundle))
 
-			for i := 0; i < 50; i++ { // Retry for up to 10 seconds
+			for i := 0; i < 75; i++ { // Retry for up to ~15 seconds
 				// 1. Try init.pid in the bundle directory (most reliable)
 				pidPath := filepath.Join(req.Bundle, "init.pid")
 				data, err := os.ReadFile(pidPath)
@@ -362,7 +376,7 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 				}
 
 				// 2. Fallback: Try getTaskPID which checks standard locations
-				if pid := s.getTaskPID(req.ID); pid > 0 {
+				if pid := s.getTaskPID(candidateIDs...); pid > 0 {
 					initPID = pid
 					debugLog(fmt.Sprintf("Resolved PID %d from getTaskPID after retry %d", initPID, i))
 					break
@@ -370,9 +384,18 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 
 				// 3. Deep Fallback: Scan cgroups (expensive but necessary for some runtimes)
 				if i > 5 { // Only try this after a few quick failures
-					if pid := s.findPIDFromCgroup(req.ID); pid > 0 {
+					debugLog(fmt.Sprintf("Running cgroup scan with candidates: %v", candidateIDs))
+					if pid := s.findPIDFromCgroup(candidateIDs); pid > 0 {
 						initPID = pid
 						debugLog(fmt.Sprintf("Resolved PID %d from cgroup scan after retry %d", initPID, i))
+						break
+					}
+
+					// 4. Shim parent: if we can find the shim for this container, use its child as init PID
+					debugLog(fmt.Sprintf("Running shim-child scan with candidates: %v", candidateIDs))
+					if pid := s.findPIDFromShim(candidateIDs); pid > 0 {
+						initPID = pid
+						debugLog(fmt.Sprintf("Resolved PID %d from shim child after retry %d", initPID, i))
 						break
 					}
 				}
@@ -396,8 +419,11 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 				debugLog(fmt.Sprintf("Init process %d state: %s (err: %v)", initPID, state, err))
 			}
 		} else {
-			debugLog("Could not resolve init PID")
-			return nil, fmt.Errorf("failed to resolve init PID for container %s", req.ID)
+			// Do not fail container startup if we cannot resolve the PID yet.
+			// This avoids breaking restore when the runtime hasn't written init.pid but
+			// the process may still come up; we can rely on later detection/logging.
+			debugLog("Could not resolve init PID – skipping CUDA restore but allowing container startup")
+			return resp, nil
 		}
 
 		if !restored {
@@ -444,27 +470,21 @@ func (s *Service) Checkpoint(ctx context.Context, req *task.CheckpointTaskReques
 		taskPID := s.getTaskPID(req.ID)
 		if taskPID > 0 {
 			if gpuPID, hasGPU := cuda.FindAnyGPUProcessForTask(taskPID); hasGPU {
-				debugLog(fmt.Sprintf("Found GPU process %d, skipping explicit CUDA checkpoint to avoid hang (relying on CRIU plugin)", gpuPID))
-				/*
-					debugLog(fmt.Sprintf("Found GPU process %d, performing CUDA checkpoint (VRAM → RAM)", gpuPID))
+				debugLog(fmt.Sprintf("Found GPU process %d, performing CUDA checkpoint (VRAM → RAM)", gpuPID))
 
-					// Check current state
-					state, err := s.cudaCheckpointer.GetState(gpuPID)
-					if err != nil {
-						debugLog(fmt.Sprintf("Failed to get CUDA state for PID %d: %v", gpuPID, err))
-					} else if state == cuda.StateRunning {
-						// Perform CUDA checkpoint: VRAM → Host RAM
-						// Use 30 second timeout for large GPU workloads
-						if err := s.cudaCheckpointer.CheckpointFull(gpuPID, 30000); err != nil {
-							debugLog(fmt.Sprintf("CUDA checkpoint failed for PID %d: %v", gpuPID, err))
-							// Continue with CRIU checkpoint anyway - GPU state might be lost
-						} else {
-							debugLog(fmt.Sprintf("CUDA checkpoint successful for PID %d - VRAM freed", gpuPID))
-						}
+				state, err := s.cudaCheckpointer.GetState(gpuPID)
+				if err != nil {
+					debugLog(fmt.Sprintf("Failed to get CUDA state for PID %d: %v", gpuPID, err))
+				} else if state == cuda.StateRunning {
+					// Perform CUDA checkpoint with a shorter timeout to avoid long hangs
+					if err := s.cudaCheckpointer.CheckpointFull(gpuPID, 10000); err != nil {
+						debugLog(fmt.Sprintf("CUDA checkpoint failed or timed out for PID %d: %v (continuing with CRIU, GPU state may be lost)", gpuPID, err))
 					} else {
-						debugLog(fmt.Sprintf("GPU process %d not in running state (state=%s), skipping CUDA checkpoint", gpuPID, state))
+						debugLog(fmt.Sprintf("CUDA checkpoint successful for PID %d - VRAM freed", gpuPID))
 					}
-				*/
+				} else {
+					debugLog(fmt.Sprintf("GPU process %d not in running state (state=%s), skipping CUDA checkpoint", gpuPID, state))
+				}
 			} else {
 				debugLog("No GPU process found in container - CPU-only checkpoint")
 			}
@@ -502,55 +522,63 @@ func (s *Service) Checkpoint(ctx context.Context, req *task.CheckpointTaskReques
 }
 
 // getTaskPID returns the PID of the container's init process
-func (s *Service) getTaskPID(containerID string) int {
-	// 1. Try reading PID from containerd's task state files
-	pidFiles := []string{
-		filepath.Join("/run/containerd/io.containerd.runtime.v2.task/k8s.io", containerID, "init.pid"),
-		filepath.Join("/var/snap/microk8s/common/run/containerd/io.containerd.runtime.v2.task/k8s.io", containerID, "init.pid"),
-	}
-
-	for _, pidFile := range pidFiles {
-		data, err := os.ReadFile(pidFile)
-		if err == nil {
-			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-			if err == nil {
-				return pid
-			}
+func (s *Service) getTaskPID(containerIDs ...string) int {
+	// Try multiple candidate IDs because bundle name and task ID can diverge on restore
+	for _, containerID := range containerIDs {
+		if containerID == "" {
+			continue
 		}
-	}
 
-	// 2. Fallback: Try querying runc state directly
-	// We try both standard runc and nvidia-container-runtime locations/binaries
-	runcRoots := []string{
-		"/run/containerd/runc/k8s.io",
-		"/var/snap/microk8s/common/run/containerd/runc/k8s.io",
-	}
+		// 1. Try reading PID from containerd's task state files
+		pidFiles := []string{
+			filepath.Join("/run/containerd/io.containerd.runtime.v2.task/k8s.io", containerID, "init.pid"),
+			filepath.Join("/var/snap/microk8s/common/run/containerd/io.containerd.runtime.v2.task/k8s.io", containerID, "init.pid"),
+		}
 
-	binaries := []string{"runc", "nvidia-container-runtime", "/snap/microk8s/current/bin/runc"}
-
-	for _, root := range runcRoots {
-		for _, bin := range binaries {
-			cmd := exec.Command(bin, "--root", root, "state", containerID)
-			output, err := cmd.Output()
+		for _, pidFile := range pidFiles {
+			data, err := os.ReadFile(pidFile)
 			if err == nil {
-				var state struct {
-					InitProcessPID int `json:"init_process_pid"`
-				}
-				if err := json.Unmarshal(output, &state); err == nil && state.InitProcessPID > 0 {
-					return state.InitProcessPID
+				pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+				if err == nil {
+					return pid
 				}
 			}
 		}
+
+		// 2. Fallback: Try querying runc state directly
+		// We try both standard runc and nvidia-container-runtime locations/binaries
+		runcRoots := []string{
+			"/run/containerd/runc/k8s.io",
+			"/var/snap/microk8s/common/run/containerd/runc/k8s.io",
+		}
+
+		binaries := []string{"runc", "nvidia-container-runtime", "/snap/microk8s/current/bin/runc"}
+
+		for _, root := range runcRoots {
+			for _, bin := range binaries {
+				cmd := exec.Command(bin, "--root", root, "state", containerID)
+				output, err := cmd.Output()
+				if err == nil {
+					var state struct {
+						InitProcessPID int `json:"init_process_pid"`
+					}
+					if err := json.Unmarshal(output, &state); err == nil && state.InitProcessPID > 0 {
+						return state.InitProcessPID
+					}
+				}
+			}
+		}
+
+		debugLog(fmt.Sprintf("Could not find init.pid for container %s", containerID))
 	}
 
-	debugLog(fmt.Sprintf("Could not find init.pid for container %s", containerID))
 	return 0
 }
 
-func (s *Service) findPIDFromCgroup(containerID string) int {
+func (s *Service) findPIDFromCgroup(containerIDs []string) int {
 	// Scan /proc to find a process belonging to the container's cgroup
 	// This is expensive but reliable if the runtime hides the PID
-	// We look for cgroup paths containing the container ID
+	// We look for cgroup paths containing any of the candidate container IDs
 
 	procDirs, err := os.ReadDir("/proc")
 	if err != nil {
@@ -570,7 +598,6 @@ func (s *Service) findPIDFromCgroup(containerID string) int {
 		cgroupPath := filepath.Join("/proc", d.Name(), "cgroup")
 		f, err := os.Open(cgroupPath)
 		if err != nil {
-			// debugLog(fmt.Sprintf("Failed to open %s: %v", cgroupPath, err))
 			continue
 		}
 
@@ -578,9 +605,14 @@ func (s *Service) findPIDFromCgroup(containerID string) int {
 		found := false
 		for scanner.Scan() {
 			line := scanner.Text()
-			if strings.Contains(line, containerID) {
-				found = true
-				debugLog(fmt.Sprintf("Found PID %d in cgroup matching %s: %s", pid, containerID, line))
+			for _, id := range containerIDs {
+				if id != "" && strings.Contains(line, id) {
+					found = true
+					debugLog(fmt.Sprintf("Found PID %d in cgroup matching %s: %s", pid, id, line))
+					break
+				}
+			}
+			if found {
 				break
 			}
 		}
@@ -591,6 +623,91 @@ func (s *Service) findPIDFromCgroup(containerID string) int {
 		}
 	}
 	return 0
+}
+
+func (s *Service) findPIDFromShim(containerIDs []string) int {
+	// Find the shim process by its command line and return its first child PID (container init)
+	procDirs, err := os.ReadDir("/proc")
+	if err != nil {
+		debugLog(fmt.Sprintf("Failed to read /proc for shim scan: %v", err))
+		return 0
+	}
+
+	for _, d := range procDirs {
+		if !d.IsDir() {
+			continue
+		}
+		pid := d.Name()
+		cmdlinePath := filepath.Join("/proc", pid, "cmdline")
+		data, err := os.ReadFile(cmdlinePath)
+		if err != nil {
+			continue
+		}
+
+		cmdline := strings.ReplaceAll(string(data), "\x00", " ")
+		if !strings.Contains(cmdline, "containerd-shim") {
+			continue
+		}
+
+		matched := false
+		for _, id := range containerIDs {
+			if id != "" && strings.Contains(cmdline, id) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+
+		childrenPath := filepath.Join("/proc", pid, "task", pid, "children")
+		childData, err := os.ReadFile(childrenPath)
+		if err != nil {
+			continue
+		}
+
+		fields := strings.Fields(string(childData))
+		if len(fields) == 0 {
+			continue
+		}
+
+		childPID, err := strconv.Atoi(fields[0])
+		if err != nil || childPID <= 0 {
+			continue
+		}
+
+		debugLog(fmt.Sprintf("Found init PID %d via shim %s (cmdline match)", childPID, pid))
+		return childPID
+	}
+
+	return 0
+}
+
+func appendCandidate(list []string, id string) []string {
+	if id == "" {
+		return list
+	}
+
+	for _, existing := range list {
+		if existing == id {
+			return list
+		}
+	}
+
+	return append(list, id)
+}
+
+func expandCandidatePrefixes(ids []string) []string {
+	out := append([]string{}, ids...)
+
+	for _, id := range ids {
+		if len(id) > 12 {
+			short := id[:12]
+			out = appendCandidate(out, short)
+		}
+	}
+
+	return out
 }
 
 func debugLog(msg string) {
