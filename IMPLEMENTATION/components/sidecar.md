@@ -56,3 +56,19 @@ Sidecar -> Agent: artifacts ready
 
 ## CRD-Beispiele
 - Keine eigenen CRDs; arbeitet auf Basis von Requests des Operators (Checkpoint/Restore/Rebalance) und Registry-Einträgen.
+
+## Performance Optimization: Zero-Copy Data Path
+
+Um die Latenz gering zu halten und unnötige Speicherkopien zu vermeiden, wird ein Zero-Copy-Ansatz für den Datentransfer zwischen Node-Agent und Sidecar angestrebt.
+
+**Konzept:**
+Anstatt dass der Node-Agent die VRAM-Daten in den RAM liest, auf die NVMe schreibt, und das Sidecar sie dann wieder liest:
+
+1.  **Shared Memory / Pipe:** Der Agent streamt die Daten direkt in eine Named Pipe oder einen Shared Memory Buffer.
+2.  **Sidecar-Streaming:** Das Sidecar liest direkt aus dieser Pipe und streamt parallel nach S3 (Multipart Upload) und optional parallel auf NVMe (als Cache).
+3.  **Vorteil:**
+    *   Reduziert I/O-Last auf der lokalen Disk drastisch.
+    *   Reduziert Latenz bis zum ersten Byte im S3.
+    *   Spart RAM-Bandbreite.
+
+**Implementierung:** Nutzung von `splice()` (Linux Syscall) um Daten vom Agent-Socket direkt in den Netzwerk-Socket des Sidecars zu schieben, ohne User-Space-Buffer-Kopien.

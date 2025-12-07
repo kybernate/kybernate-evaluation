@@ -26,3 +26,18 @@ Hauptkomponenten
 - Metadata/Registry Service als separater, ausfallsicherer Persistence-Dienst (nicht K8s-Control-Plane-etcd) mit Rebuild-Möglichkeit aus Artefakten.
 
 Hinweise zur Installation: Siehe `INSTALLATION.md`.
+
+## Detaillierte Spezifikationen
+- [API Specification](API_SPEC.md) (gRPC Proto)
+- [Artifact Layout](ARTIFACT_LAYOUT.md) (File Structure & Metadata)
+- [Failure Recovery](FAILURE_RECOVERY.md) (Error Handling Strategies)
+
+## Test Workload
+Ein GPU-Stress-Test Container steht bereit, um Checkpoint/Restore zu validieren.
+- Code: `IMPLEMENTATION/test-workload/`
+- Image: `localhost:32000/kybernate-test-workload:latest`
+- Deployment: `kubectl apply -f IMPLEMENTATION/test-workload/pod.yaml`
+
+Der Workload reserviert ca. 2GB VRAM und zählt einen Counter hoch. Nach einem Restore muss der Counter fortgesetzt werden (kein Reset auf 0).
+
+
