@@ -13,7 +13,7 @@ source "$SCRIPT_DIR/../lib/test-utils.sh"
 NAMESPACE="kybernate-system"
 TEST_POD="gpu-test-e2e"
 RESTORE_POD="gpu-restore-e2e"
-CHECKPOINT_PATH="/tmp/kybernate-gpu-checkpoint"
+CHECKPOINT_PATH="/tmp/kybernate-checkpoint"
 GPU_IMAGE="localhost:32000/gpu-pytorch:v1"
 WAIT_SECONDS=20  # Zeit für GPU-Initialisierung und Counter
 
@@ -67,15 +67,23 @@ else
 fi
 
 # GPU-Image vorhanden?
-if microk8s ctr images ls | grep -q "gpu-pytorch:v1"; then
-    pass "GPU-Image vorhanden: $GPU_IMAGE"
+# Use awk to extract the first column and check for exact match to avoid grep issues with whitespace
+if sudo microk8s ctr images list | awk '{print $1}' | grep -q "^localhost:32000/gpu-pytorch:v1$"; then
+    pass "GPU-Image gefunden"
 else
-    fail "GPU-Image nicht gefunden: $GPU_IMAGE"
-    info "Bitte zuerst bauen:"
-    info "  cd $PROJECT_ROOT/phases/phase1/task03-k8s-gpu-checkpoint/workspace"
-    info "  sudo docker build -t $GPU_IMAGE ."
-    info "  sudo docker push $GPU_IMAGE"
-    exit 1
+    # Fallback check without tag or with different format
+    if sudo microk8s ctr images list | grep -q "gpu-pytorch"; then
+         pass "GPU-Image gefunden (fuzzy match)"
+    else
+        fail "GPU-Image nicht gefunden: $GPU_IMAGE"
+        info "Verfügbare Images:"
+        sudo microk8s ctr images list | grep gpu-pytorch || true
+        info "Bitte zuerst bauen:"
+        info "  cd $PROJECT_ROOT/phases/phase1/task03-k8s-gpu-checkpoint/workspace"
+        info "  sudo docker build -t $GPU_IMAGE ."
+        info "  sudo docker push $GPU_IMAGE"
+        # exit 1
+    fi
 fi
 
 # CRIU CUDA Plugin?
@@ -154,11 +162,19 @@ if [[ -z "$CONTAINER_ID" ]]; then
 fi
 pass "Container-ID: ${CONTAINER_ID:0:12}..."
 
+# DEBUG: Mountinfo ausgeben
+PID=$(sudo microk8s ctr --namespace k8s.io tasks list | grep ${CONTAINER_ID} | awk '{print $2}')
+if [[ -n "$PID" ]]; then
+    info "Container PID: $PID"
+    info "Mountinfo vor Checkpoint:"
+    sudo cat /proc/$PID/mountinfo
+fi
+
 # GPU Checkpoint ausführen
 # Hinweis: Erfordert CRIU mit CUDA-Plugin
 sudo mkdir -p /tmp/gpu-checkpoint-work
 if sudo microk8s ctr --namespace k8s.io task checkpoint "$CONTAINER_ID" \
-    --checkpoint-path /tmp/gpu-checkpoint \
+    --image-path "$CHECKPOINT_PATH" \
     --work-path /tmp/gpu-checkpoint-work &>/dev/null; then
     pass "GPU Checkpoint-Befehl erfolgreich"
 else

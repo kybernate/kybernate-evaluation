@@ -158,6 +158,13 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 	// Check for restore annotation in the OCI spec
 	if req.Bundle != "" {
 		configPath := filepath.Join(req.Bundle, "config.json")
+
+		// Debug: Copy config.json for manual reproduction
+		if data, err := os.ReadFile(configPath); err == nil {
+			os.WriteFile("/tmp/last-config.json", data, 0644)
+			debugLog("Copied config.json to /tmp/last-config.json")
+		}
+
 		data, err := os.ReadFile(configPath)
 		if err == nil {
 			spec = &specs.Spec{}
@@ -185,7 +192,12 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 				}
 
 				// Ensure nvidia-container-runtime is used for GPU workloads
-				if hasGPUResources(spec) {
+				// We enable this for restore as well, so that NVIDIA driver mounts (libraries, etc.)
+				// are injected into the config.json. CRIU needs these mounts to match the checkpoint.
+				// UPDATE: For restore, we manually inject mounts from the checkpoint.
+				// Using nvidia-container-runtime might cause conflicts or double injection.
+				// So we ONLY use it for non-restore workloads.
+				if hasGPUResources(spec) && !isRestore {
 					// Try to modify req.Options (protobuf)
 					if req.Options != nil {
 						v, err := req.Options.UnmarshalNew()
@@ -220,6 +232,85 @@ func (s *Service) Create(ctx context.Context, req *task.CreateTaskRequest) (*tas
 					// Also try the options.json method as fallback/complement
 					if err := ensureNvidiaRuntime(req.Bundle, spec); err != nil {
 						debugLog(fmt.Sprintf("Failed to set nvidia-container-runtime via options.json: %v", err))
+					}
+				}
+
+				// If restoring, check for saved NVIDIA mounts and inject them
+				if isRestore && checkpointPath != "" {
+					mountsFile := filepath.Join(checkpointPath, "nvidia-mounts.json")
+					if data, err := os.ReadFile(mountsFile); err == nil {
+						var nvidiaMounts []cuda.MountInfo
+						if err := json.Unmarshal(data, &nvidiaMounts); err == nil {
+							debugLog(fmt.Sprintf("Injecting %d NVIDIA mounts from checkpoint", len(nvidiaMounts)))
+
+							// Add to spec.Mounts
+							for _, m := range nvidiaMounts {
+								// Check if already exists (to avoid duplicates)
+								exists := false
+								for _, existing := range spec.Mounts {
+									if existing.Destination == m.Destination {
+										exists = true
+										break
+									}
+								}
+
+								if !exists {
+									spec.Mounts = append(spec.Mounts, specs.Mount{
+										Source:      m.Source,
+										Destination: m.Destination,
+										Type:        m.Type,
+										Options:     m.Options,
+									})
+									debugLog(fmt.Sprintf("Injected mount: %s -> %s", m.Source, m.Destination))
+								}
+							}
+
+							// Write updated spec back to config.json
+							if newData, err := json.Marshal(spec); err == nil {
+								if err := os.WriteFile(configPath, newData, 0644); err != nil {
+									debugLog(fmt.Sprintf("Failed to write updated config.json: %v", err))
+								} else {
+									debugLog("Updated config.json with injected mounts")
+									// Save a copy for debugging in a shared directory
+									debugPath := "/var/snap/microk8s/common/run/debug-config.json"
+									os.WriteFile(debugPath, newData, 0644)
+									debugLog(fmt.Sprintf("Wrote debug config to %s", debugPath))
+								}
+							}
+							// Also ensure directories/files exist for these mounts
+							rootfs := filepath.Join(req.Bundle, "rootfs")
+							for _, m := range nvidiaMounts {
+								relPath := strings.TrimPrefix(m.Destination, "/")
+								fullPath := filepath.Join(rootfs, relPath)
+
+								// Check source on host to determine if dir or file
+								fi, err := os.Stat(m.Source)
+								if err == nil {
+									if fi.IsDir() {
+										os.MkdirAll(fullPath, 0755)
+									} else {
+										// Ensure parent dir exists
+										os.MkdirAll(filepath.Dir(fullPath), 0755)
+										// Create empty file if not exists
+										f, err := os.OpenFile(fullPath, os.O_RDONLY|os.O_CREATE, 0644)
+										if err == nil {
+											f.Close()
+										}
+									}
+								} else {
+									// Fallback: assume directory if no extension?
+									if strings.Contains(filepath.Base(m.Destination), ".") {
+										os.MkdirAll(filepath.Dir(fullPath), 0755)
+										f, err := os.OpenFile(fullPath, os.O_RDONLY|os.O_CREATE, 0644)
+										if err == nil {
+											f.Close()
+										}
+									} else {
+										os.MkdirAll(fullPath, 0755)
+									}
+								}
+							}
+						}
 					}
 				}
 			}
@@ -353,26 +444,44 @@ func (s *Service) Checkpoint(ctx context.Context, req *task.CheckpointTaskReques
 		taskPID := s.getTaskPID(req.ID)
 		if taskPID > 0 {
 			if gpuPID, hasGPU := cuda.FindAnyGPUProcessForTask(taskPID); hasGPU {
-				debugLog(fmt.Sprintf("Found GPU process %d, performing CUDA checkpoint (VRAM → RAM)", gpuPID))
+				debugLog(fmt.Sprintf("Found GPU process %d, skipping explicit CUDA checkpoint to avoid hang (relying on CRIU plugin)", gpuPID))
+				/*
+					debugLog(fmt.Sprintf("Found GPU process %d, performing CUDA checkpoint (VRAM → RAM)", gpuPID))
 
-				// Check current state
-				state, err := s.cudaCheckpointer.GetState(gpuPID)
-				if err != nil {
-					debugLog(fmt.Sprintf("Failed to get CUDA state for PID %d: %v", gpuPID, err))
-				} else if state == cuda.StateRunning {
-					// Perform CUDA checkpoint: VRAM → Host RAM
-					// Use 30 second timeout for large GPU workloads
-					if err := s.cudaCheckpointer.CheckpointFull(gpuPID, 30000); err != nil {
-						debugLog(fmt.Sprintf("CUDA checkpoint failed for PID %d: %v", gpuPID, err))
-						// Continue with CRIU checkpoint anyway - GPU state might be lost
+					// Check current state
+					state, err := s.cudaCheckpointer.GetState(gpuPID)
+					if err != nil {
+						debugLog(fmt.Sprintf("Failed to get CUDA state for PID %d: %v", gpuPID, err))
+					} else if state == cuda.StateRunning {
+						// Perform CUDA checkpoint: VRAM → Host RAM
+						// Use 30 second timeout for large GPU workloads
+						if err := s.cudaCheckpointer.CheckpointFull(gpuPID, 30000); err != nil {
+							debugLog(fmt.Sprintf("CUDA checkpoint failed for PID %d: %v", gpuPID, err))
+							// Continue with CRIU checkpoint anyway - GPU state might be lost
+						} else {
+							debugLog(fmt.Sprintf("CUDA checkpoint successful for PID %d - VRAM freed", gpuPID))
+						}
 					} else {
-						debugLog(fmt.Sprintf("CUDA checkpoint successful for PID %d - VRAM freed", gpuPID))
+						debugLog(fmt.Sprintf("GPU process %d not in running state (state=%s), skipping CUDA checkpoint", gpuPID, state))
 					}
-				} else {
-					debugLog(fmt.Sprintf("GPU process %d not in running state (state=%s), skipping CUDA checkpoint", gpuPID, state))
-				}
+				*/
 			} else {
 				debugLog("No GPU process found in container - CPU-only checkpoint")
+			}
+
+			// Detect and save all NVIDIA mounts (needed for restore)
+			nvidiaMounts, err := cuda.FindNvidiaMounts(taskPID)
+			if err == nil && len(nvidiaMounts) > 0 {
+				debugLog(fmt.Sprintf("Found %d NVIDIA mounts", len(nvidiaMounts)))
+				mountsFile := filepath.Join(req.Path, "nvidia-mounts.json")
+				data, err := json.Marshal(nvidiaMounts)
+				if err == nil {
+					if err := os.WriteFile(mountsFile, data, 0644); err != nil {
+						debugLog(fmt.Sprintf("Failed to write nvidia-mounts.json: %v", err))
+					}
+				} else {
+					debugLog(fmt.Sprintf("Failed to marshal mounts: %v", err))
+				}
 			}
 		}
 	}
@@ -485,10 +594,15 @@ func (s *Service) findPIDFromCgroup(containerID string) int {
 }
 
 func debugLog(msg string) {
-	f, err := os.OpenFile("/tmp/kybernate-shim.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile("/var/snap/microk8s/common/run/kybernate-shim.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return
+		// Fallback to /tmp if the snap path is not accessible
+		f, err = os.OpenFile("/tmp/kybernate-shim.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return
+		}
 	}
 	defer f.Close()
-	f.WriteString(msg + "\n")
+	timestamp := time.Now().Format(time.RFC3339)
+	f.WriteString(fmt.Sprintf("%s: %s\n", timestamp, msg))
 }
