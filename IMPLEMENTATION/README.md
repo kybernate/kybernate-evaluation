@@ -35,6 +35,9 @@ Hinweise zur Installation: Siehe `INSTALLATION.md`.
 - [Makefile](Makefile) (Build Automation)
 - [Container Engine Integration](CONTAINER_ENGINE_INTEGRATION.md) (Containerd API vs. Runc/CRIU)
 - [Restore Flow & Portability](RESTORE_FLOW.md) (Cross-Node/Cross-GPU Details)
+- [Cold Storage Strategy](COLD_STORAGE_STRATEGY.md) (Buildah Fallback)
+- [Test Workflow](TEST_WORKFLOW.md) (Step-by-Step Validation Guide)
+- [Implementation Task List](TASK_LIST.md) (Granular Step-by-Step Plan)
 
 ## Test Workload
 Ein GPU-Stress-Test Container steht bereit, um Checkpoint/Restore zu validieren.

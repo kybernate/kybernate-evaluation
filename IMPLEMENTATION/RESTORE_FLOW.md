@@ -61,3 +61,21 @@ Das System ist explizit dafür ausgelegt, Workloads auf anderer Hardware fortzus
 ### Einschränkungen
 *   **Hardware-Generation:** Ein Restore von einer Ampere-GPU (A100) auf eine ältere Pascal-GPU (P100) funktioniert oft nicht, wenn der Code Features nutzt, die die alte Karte nicht hat. Umgekehrt (alt auf neu) ist meist kompatibel.
 *   **Driver Version:** Der NVIDIA Treiber auf dem Ziel-Node muss gleich oder neuer sein als auf dem Quell-Node.
+
+## NVIDIA Mounts Injection (config.json)
+
+Ein kritischer Schritt beim Restore ist die korrekte Konfiguration der Container-Runtime-Spec (`config.json`).
+
+**Problem:**
+Wenn `runc restore` ausgeführt wird, erwartet CRIU, dass die Dateisystem-Umgebung exakt der des Checkpoints entspricht. Allerdings fehlen im "leeren" Pod-Container oft die NVIDIA-spezifischen Mounts (Treiber-Libs, Devices), da diese normalerweise erst vom `nvidia-container-runtime-hook` *nach* dem Start injiziert werden. Beim Restore überspringen wir aber den normalen Start.
+
+**Lösung:**
+Der Kybernate Shim muss die `config.json` vor dem Aufruf von `runc restore` patchen.
+
+1.  **Erkennung:** Der Shim liest die `NVIDIA_VISIBLE_DEVICES` Env-Variable.
+2.  **Injection:** Er fügt manuell die notwendigen Mounts hinzu:
+    *   `/dev/nvidiaX` (entsprechend der zugewiesenen GPU)
+    *   `/dev/nvidia-uvm`, `/dev/nvidia-ctl`
+    *   Treiber-Bibliotheken (`libcuda.so`, etc.) – oft via `nvidia-container-cli` ermittelbar.
+3.  **Konsistenz:** Dies stellt sicher, dass der wiederhergestellte Prozess Zugriff auf die GPU-Hardware hat, bevor der CUDA-Kontext wiederhergestellt wird.
+
