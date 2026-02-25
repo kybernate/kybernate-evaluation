@@ -16,7 +16,7 @@ sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin 
 sudo usermod -aG docker $USER
 ```
 
-## NVIDIA Driver and CUDA Toolkit 13
+## NVIDIA Driver and CUDA Toolkit 13-1
 
 * https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/ubuntu.html#ubuntu-installation
 * * https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=24.04&target_type=deb_network
@@ -32,7 +32,7 @@ wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt update
 
-sudo apt install -y cuda-drivers cuda-toolkit-13-0
+sudo apt install -y cuda-drivers cuda-toolkit-13-1
 
 echo -e "blacklist nouveau\noptions nouveau modeset=0" | sudo tee /etc/modprobe.d/blacklist-nouveau.conf
 sudo update-initramfs -u
@@ -47,7 +47,7 @@ nvidia-smi
 Make cuda tool kit reachable
 
 ```
-sudo ln -s /usr/local/cuda-13.0 /usr/local/cuda
+sudo ln -s /usr/local/cuda-13.1 /usr/local/cuda
 
 sudo tee /etc/profile.d/cuda.sh >/dev/null <<EOF
 export PATH=/usr/local/cuda/bin:\$PATH
